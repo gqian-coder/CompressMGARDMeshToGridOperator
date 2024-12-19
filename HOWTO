@@ -1,0 +1,45 @@
+mkdir build
+cd build
+. ../runconf   # Change ADIOS2_DIR and MGARD_DIR to your installations
+make
+
+Note the full path location of libCompressMGARDMeshToGridOperator.so
+e.g.  /home/adios/shared/Software/playground/CompressMGARDMeshToGridOperator/build
+
+Need to add this path to ADIOS2_PLUGIN_PATH (just the folder, not the .so file)
+
+In application runtime directory: (e.g. Gray-Scott)
+
+1) XML adios config file:
+
+        <variable name="U">
+            <operation type="plugin">
+                <parameter key="PluginName" value="qiange"/>
+                <parameter key="PluginLibrary" value="CompressMGARDMeshToGridOperator"/>
+                <parameter key="meshfile" value="mesh.bp"/>
+                <parameter key="accuracy" value="0.001"/>
+            </operation>
+        </variable>
+
+PluginName is arbitrary string
+PluginLibrary is the name of the libXXXX.so 
+meshfile is the new parameter for this operator
+accuracy and other parameters are the MGARD operator arguments
+
+2) in source code instead of xml
+
+    // for an adios2::Variable<T> var
+    adios2::Params params;
+    params["PluginName"] = "MyOperator";
+    params["PluginLibrary"] = "CompressMGARDMeshToGridOperator";
+    params["meshfile"] = "mesh.bp";
+    params["accuracy"] = "0.001";
+    var.AddOperation("plugin", params);
+
+
+Runtime example for gray-scott at /home/qian/Software/ADIOS2/examples/simulations/gray-scott/:
+
+$ export ADIOS2_PLUGIN_PATH=/home/qian/Software/CompressMGARDMeshToGridOperator/build
+$ mpirun -n 1 ../bin/adios2_simulations_gray-scott simulation/settings-files.json
+
+

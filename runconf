@@ -1,0 +1,4 @@
+ADIOS2_DIR=/home/qian/Software/ADIOS2/install-adios
+MGARD_DIR=/home/qian/Software/MGARD/install-cuda-turing
+
+cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_DIR}"

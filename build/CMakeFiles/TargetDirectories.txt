@@ -1,0 +1,3 @@
+/home/qian/Software/CompressMGARDMeshToGridOperator/build/CMakeFiles/CompressMGARDMeshToGridOperator.dir
+/home/qian/Software/CompressMGARDMeshToGridOperator/build/CMakeFiles/edit_cache.dir
+/home/qian/Software/CompressMGARDMeshToGridOperator/build/CMakeFiles/rebuild_cache.dir
