@@ -17,6 +17,7 @@
 
 #include <cstring>
 #include <mutex>
+#include <map>
 
 namespace adios2
 {
@@ -26,16 +27,14 @@ namespace plugin
 /* "STATIC" PART of operator to have read mesh only once */
 std::string meshFileName;
 std::mutex readMeshMutex;
-bool meshReadSuccessfully = false;
-bool debugging = false;
+//bool meshReadSuccessfully = false;
+std::map<int, int> blockMeshMap;
+// the block id used for the associated metadata stored in mesh vectors 
+size_t blockId;
+// the original block id used for reading from meshFile 
+int mapId;
 
-// relative block id, always starting from 0 for each variables, reading through the loaded mesh blocks
-size_t blockId = 0;
-// the real block id in the original data file 
-size_t real_blockId;
-// used for decompression...assuming each rank will decompress the same set of consecutive blocks across variables
-int    offset_bId  = -1; // only initialize once for each rank
-size_t max_blockId = 0;
+bool debugging = false;
 
 std::vector<std::vector<size_t>> nodeMapGrid;  // stacking multiple blocks of parameters 
 std::vector<std::vector<size_t>> nCluster;     // stacking multiple blocks of parameters 
@@ -44,14 +43,14 @@ std::vector<bool>   sparsity;                  // size equals to the number of b
 
 // define mesh mapping variable files
 
-void ReadMesh(std::string meshfile, std::string Blc, std::string numBlc)
+void ReadMesh(std::string meshfile, std::string Blc)
 {
-    //std::cout << "=== Reading Mesh File " << meshfile << " ===" << std::endl;
-    meshReadSuccessfully = true;
+    //meshReadSuccessfully = true;
     meshFileName = meshfile;
     size_t bId = (size_t)std::stoi(Blc);
-    size_t nBlocks = (size_t)std::stoi(numBlc);
-    std::cout << "Reading Mesh File " << meshfile <<  "starting from block " << bId << " for " << nBlocks << " blocks\n"; 
+    if (debugging) {
+        std::cout << "Reading Mesh File " << meshfile <<  "starting from block " << bId << "\n"; 
+    }
 
     adios2::Variable<size_t> var_map, var_cluster, var_gridDim;
     adios2::Variable<char> var_sparse;
@@ -76,23 +75,23 @@ void ReadMesh(std::string meshfile, std::string Blc, std::string numBlc)
         var_sparse  = reader_io_m.InquireVariable<char>("GridSparsity");
         auto info = reader_mesh.BlocksInfo(var_map, 0);
         //std::cout << "number of blocks in total: " << info.size() << "\n"; 
-        for (size_t bi=bId; bi<bId+nBlocks; bi++) {
-            var_map.SetBlockSelection(bi);
-            var_cluster.SetBlockSelection(bi);
-            var_gridDim.SetBlockSelection(bi);
-            var_sparse.SetBlockSelection(bi);
-            std::vector<size_t> nodeMapGrid_t, nCluster_t, resampleRate_t;
-            char sparsity_t;
-            reader_mesh.Get<size_t>(var_map    , nodeMapGrid_t , adios2::Mode::Sync);
-            reader_mesh.Get<size_t>(var_cluster, nCluster_t    , adios2::Mode::Sync);
-            reader_mesh.Get<size_t>(var_gridDim, resampleRate_t, adios2::Mode::Sync);
-            reader_mesh.Get<char>(var_sparse ,   &sparsity_t   , adios2::Mode::Sync);
-            reader_mesh.PerformGets();
-            nodeMapGrid.push_back(nodeMapGrid_t);
-            nCluster.push_back(nCluster_t);
-            resampleRate.push_back(resampleRate_t);
-            sparsity.push_back(sparsity_t);
-        }
+
+        var_map.SetBlockSelection(bId);
+        var_cluster.SetBlockSelection(bId);
+        var_gridDim.SetBlockSelection(bId);
+        var_sparse.SetBlockSelection(bId);
+        std::vector<size_t> nodeMapGrid_t, nCluster_t, resampleRate_t;
+        char sparsity_t;
+        reader_mesh.Get<size_t>(var_map    , nodeMapGrid_t , adios2::Mode::Sync);
+        reader_mesh.Get<size_t>(var_cluster, nCluster_t    , adios2::Mode::Sync);
+        reader_mesh.Get<size_t>(var_gridDim, resampleRate_t, adios2::Mode::Sync);
+        reader_mesh.Get<char>(var_sparse ,   &sparsity_t   , adios2::Mode::Sync);
+        reader_mesh.PerformGets();
+        nodeMapGrid.push_back(nodeMapGrid_t);
+        nCluster.push_back(nCluster_t);
+        resampleRate.push_back(resampleRate_t);
+        sparsity.push_back(sparsity_t);
+
         reader_mesh.EndStep();
     }
     reader_mesh.Close();
@@ -139,7 +138,6 @@ CompressMGARDMeshToGridOperator::CompressMGARDMeshToGridOperator(const Params &p
 {
     if (debugging) std::cout << "=== CompressMGARDMeshToGridOperator constructor ===" << std::endl;
 
-    blockId = 0;
     std::string meshfile;
     auto itMeshFileName = m_Parameters.find("meshfile");
     if (itMeshFileName == m_Parameters.end())
@@ -149,36 +147,39 @@ CompressMGARDMeshToGridOperator::CompressMGARDMeshToGridOperator(const Params &p
         meshfile = itMeshFileName->second;
     }
 
-    auto itBlockId = m_Parameters.find("block");
+    // Each var.AddOperator() will call this constructor, and we set blockId back to 0 to read meshMap from the beginning
+    blockId = 0; 
+    mapId   = std::numeric_limits<int>::max(); 
+    auto itBlockId = m_Parameters.find("blocks");
+    int bid;
     if (itBlockId == m_Parameters.end()) {
-        if (debugging) std::cout << "This operator needs a blockId input with parameter name 'block'...ignore the warming for decompression\n";
-        //helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
-        //                                     "This operator needs a blockId input with parameter name 'block'");
+        if (debugging) std::cout << "This operator needs a list of blockId with parameter name 'blockList' as input...ignore the warming for decompression\n";
     } else {
-        real_blockId = (size_t)std::stoi(itBlockId->second);
-    }
-    auto itBlock_N = m_Parameters.find("nblocks");
-    if (itBlock_N == m_Parameters.end()) {
-        if (debugging) std::cout << "This operator needs a number of blocks input with parameter name 'nblocks'...ignore the warming for decompression\n";
-        // helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
-        //                                     "This operator needs a number of blocks input with parameter name 'nblocks'");
-    }
-    if (!meshfile.empty() && !meshReadSuccessfully)
-    {
-        std::lock_guard<std::mutex> lck(readMeshMutex);
-        if (!meshFileName.empty() && meshfile != meshFileName)
-        {
-            helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
+        std::istringstream iss(itBlockId->second);
+        std::cout << itBlockId->second << "\n";
+        while (iss >> bid) {
+            mapId = (mapId > bid) ? bid : mapId;
+            if (blockMeshMap.find(bid) == blockMeshMap.end()) {
+                // if the requested block has not been loaded
+                if (!meshfile.empty()) {
+                    std::lock_guard<std::mutex> lck(readMeshMutex);
+                    if (!meshFileName.empty() && meshfile != meshFileName) {
+                        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
                                                  "Cannot process more than one mesh files. Already read " + meshFileName);
-        }
-        ReadMesh(itMeshFileName->second, itBlockId->second, itBlock_N->second);
+                    } 
+                    ReadMesh(itMeshFileName->second, std::to_string(bid));
+                    // insert a new blockId
+                    blockMeshMap[bid] = blockMeshMap.size();
+                }
+            }
+        } 
     }
 }
 
 size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &blockStart, const Dims &blockCount,
                                                 const DataType type, char *bufferOut)
 {
-    //std::cout << "=== CompressMGARDMeshToGridOperator::Operate() ===" << std::endl;
+    if (debugging) std::cout << "=== CompressMGARDMeshToGridOperator::Operate() ===" << std::endl;
     const uint8_t bufferVersion = 1;
     size_t bufferOutOffset = 0;
 
@@ -192,15 +193,14 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
         helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "Operate",
                                              "MGARD does not support data in " + std::to_string(ndims) + " dimensions");
     }
-
     // mgard V1 metadata
     // DEBUG: store remesh filename and the block Id -- is here a good place to store meshFileName?
     PutParameter(bufferOut, bufferOutOffset, meshFileName.length());
     for (size_t i=0; i<meshFileName.length(); i++) {
         PutParameter(bufferOut, bufferOutOffset, meshFileName.c_str()[i]);
     }
-    PutParameter(bufferOut, bufferOutOffset, real_blockId + blockId);
-    if (debugging) std::cout << "store meshFileName ``" << meshFileName.data() << "'', length " << meshFileName.length() << " and blockId " << blockId + real_blockId << " into metadata\n"; 
+    PutParameter(bufferOut, bufferOutOffset, mapId + blockId);
+    if (debugging) std::cout << "store meshFileName ``" << meshFileName.data() << "'', length " << meshFileName.length() << " and blockId " << blockId + mapId << " into metadata\n"; 
 
     PutParameter(bufferOut, bufferOutOffset, ndims);
     for (const auto &d : convertedDims)
@@ -403,7 +403,7 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
 
     const bool isCompressed = GetParameter<bool>(bufferIn, bufferInOffset);
     size_t compressedSize_resi = GetParameter<size_t>(bufferIn, bufferInOffset);
-    //std::cout << "blockId = " << real_blockId << ", compressed residual data bytes = " << compressedSize_resi << ", compressed grid data bytes = " << sizeIn - bufferInOffset - compressedSize_resi << ", sizeIn = " << sizeIn - bufferInOffset << ", bufferInOffset = " << bufferInOffset << "\n";
+    //std::cout << "blockId = " << blockId << ", compressed residual data bytes = " << compressedSize_resi << ", compressed grid data bytes = " << sizeIn - bufferInOffset - compressedSize_resi << ", sizeIn = " << sizeIn - bufferInOffset << ", bufferInOffset = " << bufferInOffset << "\n";
 
     size_t sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
 
@@ -422,11 +422,10 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
             mgard_x::decompress(bufferIn + bufferInOffset + compressedSize_resi, sizeIn - bufferInOffset - compressedSize_resi, GridPointVal, false);
             std::cout << "nodeMapGrid: " << nodeMapGrid.size() << ", " << nodeMapGrid[blockId].size() << "\n";
             if (type == helper::GetDataType<float>()) {
-                recompose_remesh<float>(nodeMapGrid[real_blockId-offset_bId], GridPointVal, dataOutVoid);
+                recompose_remesh<float>(nodeMapGrid[blockId], GridPointVal, dataOutVoid);
             } else if (type == helper::GetDataType<double>()) {
-                recompose_remesh<double>(nodeMapGrid[real_blockId-offset_bId], GridPointVal, dataOutVoid);
+                recompose_remesh<double>(nodeMapGrid[blockId], GridPointVal, dataOutVoid);
             }
-            blockId ++;
             std::cout << "finish recompositing\n";
         }
         catch (...)
@@ -456,17 +455,17 @@ size_t CompressMGARDMeshToGridOperator::InverseOperate(const char *bufferIn, con
         for (size_t i=0; i<meshFileName_len; i++) {
             meshfile.insert(meshfile.end(), GetParameter<char>(bufferIn, bufferInOffset));
         } 
-        real_blockId = GetParameter<size_t>(bufferIn, bufferInOffset); 
-        if (debugging) std::cout << "Read the meshFileName ``" << meshfile.c_str() << "'' for (de)compression: blockId = "<< real_blockId << "\n";
-        if (offset_bId<0) { 
-            offset_bId = real_blockId;
-        }
-        if (max_blockId <= (real_blockId-offset_bId))
-        {
+        mapId = GetParameter<size_t>(bufferIn, bufferInOffset); 
+        if (debugging) std::cout << "Read the meshFileName ``" << meshfile.c_str() << "'' for (de)compression: blockId = "<< mapId << "\n";
+        if (blockMeshMap.find(mapId) == blockMeshMap.end()) {
+            // the requested block has not been loaded
             std::lock_guard<std::mutex> lck(readMeshMutex);
-            ReadMesh(meshfile, std::to_string(real_blockId), std::to_string(1));
-            max_blockId ++;
+            ReadMesh(meshfile, std::to_string(mapId));
+            blockMeshMap[mapId] = blockMeshMap.size();    
         } 
+        blockId = blockMeshMap[mapId];
+        if (debugging) std::cout << "load from block "<< blockId << "\n";
+        
         return DecompressV1(bufferIn + bufferInOffset, sizeIn - bufferInOffset, dataOut);
     }
     else if (bufferVersion == 2)
