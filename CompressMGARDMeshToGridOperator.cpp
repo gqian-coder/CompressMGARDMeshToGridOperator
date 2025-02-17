@@ -27,9 +27,15 @@ namespace plugin
 std::string meshFileName;
 std::mutex readMeshMutex;
 bool meshReadSuccessfully = false;
+bool debugging = false;
 
+// relative block id, always starting from 0 for each variables, reading through the loaded mesh blocks
 size_t blockId = 0;
-size_t nBlocks;
+// the real block id in the original data file 
+size_t real_blockId;
+// used for decompression...assuming each rank will decompress the same set of consecutive blocks across variables
+int    offset_bId  = -1; // only initialize once for each rank
+size_t max_blockId = 0;
 
 std::vector<std::vector<size_t>> nodeMapGrid;  // stacking multiple blocks of parameters 
 std::vector<std::vector<size_t>> nCluster;     // stacking multiple blocks of parameters 
@@ -40,12 +46,12 @@ std::vector<bool>   sparsity;                  // size equals to the number of b
 
 void ReadMesh(std::string meshfile, std::string Blc, std::string numBlc)
 {
-    std::cout << "=== Reading Mesh File " << meshfile << " ===" << std::endl;
+    //std::cout << "=== Reading Mesh File " << meshfile << " ===" << std::endl;
     meshReadSuccessfully = true;
     meshFileName = meshfile;
     size_t bId = (size_t)std::stoi(Blc);
-    nBlocks = (size_t)std::stoi(numBlc);
-    std::cout << "readin starting from block " << bId << " for " << nBlocks << " blocks\n"; 
+    size_t nBlocks = (size_t)std::stoi(numBlc);
+    std::cout << "Reading Mesh File " << meshfile <<  "starting from block " << bId << " for " << nBlocks << " blocks\n"; 
 
     adios2::Variable<size_t> var_map, var_cluster, var_gridDim;
     adios2::Variable<char> var_sparse;
@@ -131,29 +137,33 @@ void recompose_remesh(std::vector<size_t> nodeMapGrid,
 
 CompressMGARDMeshToGridOperator::CompressMGARDMeshToGridOperator(const Params &parameters) : PluginOperatorInterface(parameters)
 {
-    std::cout << "=== CompressMGARDMeshToGridOperator constructor ===" << std::endl;
+    if (debugging) std::cout << "=== CompressMGARDMeshToGridOperator constructor ===" << std::endl;
+
     blockId = 0;
+    std::string meshfile;
     auto itMeshFileName = m_Parameters.find("meshfile");
     if (itMeshFileName == m_Parameters.end())
     {
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
-                                             "This operator needs an unstructured mesh input file with parameter name 'meshfile'");
+        if (debugging) std::cout <<"This operator needs an unstructured mesh input file with parameter name 'meshfile' for compression...ignore the warming for decompression\n";
+    } else {
+        meshfile = itMeshFileName->second;
     }
-    std::string &meshfile = itMeshFileName->second;
 
-    std::cout << "meshfile = " << meshfile << "\n";
     auto itBlockId = m_Parameters.find("block");
     if (itBlockId == m_Parameters.end()) {
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
-                                             "This operator needs a blockId input with parameter name 'block'");
+        if (debugging) std::cout << "This operator needs a blockId input with parameter name 'block'...ignore the warming for decompression\n";
+        //helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
+        //                                     "This operator needs a blockId input with parameter name 'block'");
+    } else {
+        real_blockId = (size_t)std::stoi(itBlockId->second);
     }
     auto itBlock_N = m_Parameters.find("nblocks");
     if (itBlock_N == m_Parameters.end()) {
-        helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
-                                             "This operator needs a number of blocks input with parameter name 'nblocks'");
+        if (debugging) std::cout << "This operator needs a number of blocks input with parameter name 'nblocks'...ignore the warming for decompression\n";
+        // helper::Throw<std::invalid_argument>("Operator", "CompressMGARDMeshToGridOperator", "constructor",
+        //                                     "This operator needs a number of blocks input with parameter name 'nblocks'");
     }
-    std::cout << "meshfile = " << meshfile << ", nblocks = " << itBlock_N->second << "\n";
-    if (!meshReadSuccessfully)
+    if (!meshfile.empty() && !meshReadSuccessfully)
     {
         std::lock_guard<std::mutex> lck(readMeshMutex);
         if (!meshFileName.empty() && meshfile != meshFileName)
@@ -184,6 +194,14 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     }
 
     // mgard V1 metadata
+    // DEBUG: store remesh filename and the block Id -- is here a good place to store meshFileName?
+    PutParameter(bufferOut, bufferOutOffset, meshFileName.length());
+    for (size_t i=0; i<meshFileName.length(); i++) {
+        PutParameter(bufferOut, bufferOutOffset, meshFileName.c_str()[i]);
+    }
+    PutParameter(bufferOut, bufferOutOffset, real_blockId + blockId);
+    if (debugging) std::cout << "store meshFileName ``" << meshFileName.data() << "'', length " << meshFileName.length() << " and blockId " << blockId + real_blockId << " into metadata\n"; 
+
     PutParameter(bufferOut, bufferOutOffset, ndims);
     for (const auto &d : convertedDims)
     {
@@ -304,8 +322,6 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     config.lossless = mgard_x::lossless_type::Huffman_Zstd;
 
     PutParameter(bufferOut, bufferOutOffset, true);
-    // remesh filename
-    //PutParameter(bufferOut, bufferOutOffset, meshFileName);
 
     // remesh start here
     mgard_x::DIM mgardDim_gd = ndims;
@@ -328,17 +344,19 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     } else if (type == helper::GetDataType<double>()) {
         calc_GridValResi<double>(nodeMapGrid[blockId], nCluster[blockId], MeshResidVal, GridPointVal, nNodePt, nGridPt);
     }
-    // compress mesh residuals
+    // compress mesh residuals...saving 8 bytes for storing the compressed meshResi size
     void *compressedData = bufferOut + bufferOutOffset + sizeof(size_t);
     mgard_x::compress(mgardDim, mgardType, mgardCount, tol_data, s, errorBoundType, MeshResidVal, compressedData, sizeOut, config, true);
     free(MeshResidVal);
-    std::cout << "ndims = " << ndims << ", number of Grid points: " << nGridPt << ", mesh points: " << nNodePt << "\n";
-    //std::cout << "tolerance = " << tolerance << ", data tol = " << tol_data << ", resi tol = " << tol_resi << "\n";
-    std::cout << "Block " << blockId << ": bufferOutOffset before = " << bufferOutOffset;
-    // store the compressed size of the mesh residual data
+
+    if (debugging) std::cout << "Block " << blockId << ": bufferOutOffset before = " << bufferOutOffset;
+
+    // Important!!! store the compressed size of the mesh residual data before the compressed bytes
     PutParameter(bufferOut, bufferOutOffset, sizeOut);
     bufferOutOffset += sizeOut;
-    std::cout << ", (compressed meshResi size = " << sizeOut << "), ";
+
+    if (debugging) std::cout << ", (compressed meshResi size = " << sizeOut << "), ";
+
     // compress grid interpolation
     compressedData = bufferOut + bufferOutOffset;
     sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
@@ -353,7 +371,7 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     }
     mgard_x::compress(mgardDim_gd, mgardType, mgardCount_gd, tol_resi, s, errorBoundType, GridPointVal, compressedData, sizeOut, config, true);
     bufferOutOffset += sizeOut;
-    std::cout << "final bufferOutOffset = " << bufferOutOffset << " (compressed GridPt size = " << sizeOut << ")\n"; 
+    if (debugging) std::cout << "final bufferOutOffset = " << bufferOutOffset << " (compressed GridPt size = " << sizeOut << ")\n"; 
     free(GridPointVal); 
     blockId ++;
     
@@ -385,7 +403,7 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
 
     const bool isCompressed = GetParameter<bool>(bufferIn, bufferInOffset);
     size_t compressedSize_resi = GetParameter<size_t>(bufferIn, bufferInOffset);
-    std::cout << "compressed residual data bytes = " << compressedSize_resi << ", sizeIn = " << sizeIn - bufferInOffset <<"\n";
+    //std::cout << "blockId = " << real_blockId << ", compressed residual data bytes = " << compressedSize_resi << ", compressed grid data bytes = " << sizeIn - bufferInOffset - compressedSize_resi << ", sizeIn = " << sizeIn - bufferInOffset << ", bufferInOffset = " << bufferInOffset << "\n";
 
     size_t sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
 
@@ -402,12 +420,14 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
             void *GridPointVal = NULL; 
             mgard_x::decompress(bufferIn + bufferInOffset, compressedSize_resi, dataOutVoid, true);
             mgard_x::decompress(bufferIn + bufferInOffset + compressedSize_resi, sizeIn - bufferInOffset - compressedSize_resi, GridPointVal, false);
+            std::cout << "nodeMapGrid: " << nodeMapGrid.size() << ", " << nodeMapGrid[blockId].size() << "\n";
             if (type == helper::GetDataType<float>()) {
-                recompose_remesh<float>(nodeMapGrid[0], GridPointVal, dataOutVoid);
+                recompose_remesh<float>(nodeMapGrid[real_blockId-offset_bId], GridPointVal, dataOutVoid);
             } else if (type == helper::GetDataType<double>()) {
-                recompose_remesh<double>(nodeMapGrid[0], GridPointVal, dataOutVoid);
+                recompose_remesh<double>(nodeMapGrid[real_blockId-offset_bId], GridPointVal, dataOutVoid);
             }
-            free(GridPointVal);
+            blockId ++;
+            std::cout << "finish recompositing\n";
         }
         catch (...)
         {
@@ -422,16 +442,31 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
 
 size_t CompressMGARDMeshToGridOperator::InverseOperate(const char *bufferIn, const size_t sizeIn, char *dataOut)
 {
-    std::cout << "=== CompressMGARDMeshToGridOperator::InverseOperate() ===" << std::endl; 
+    if (debugging) std::cout << "=== CompressMGARDMeshToGridOperator::InverseOperate() ===" << std::endl; 
     size_t bufferInOffset = 1; // skip operator type
     const uint8_t bufferVersion = GetParameter<uint8_t>(bufferIn, bufferInOffset);
     bufferInOffset += 2; // skip two reserved bytes
     headerSize = bufferInOffset;
+    std::string meshfile;
 
     if (bufferVersion == 1)
     {
         // Need to think how to load the meshfile
-        //ReadMesh(meshFileName, std::to_string(blockId), std::to_string(1));
+        const size_t meshFileName_len = GetParameter<size_t>(bufferIn, bufferInOffset);
+        for (size_t i=0; i<meshFileName_len; i++) {
+            meshfile.insert(meshfile.end(), GetParameter<char>(bufferIn, bufferInOffset));
+        } 
+        real_blockId = GetParameter<size_t>(bufferIn, bufferInOffset); 
+        if (debugging) std::cout << "Read the meshFileName ``" << meshfile.c_str() << "'' for (de)compression: blockId = "<< real_blockId << "\n";
+        if (offset_bId<0) { 
+            offset_bId = real_blockId;
+        }
+        if (max_blockId <= (real_blockId-offset_bId))
+        {
+            std::lock_guard<std::mutex> lck(readMeshMutex);
+            ReadMesh(meshfile, std::to_string(real_blockId), std::to_string(1));
+            max_blockId ++;
+        } 
         return DecompressV1(bufferIn + bufferInOffset, sizeIn - bufferInOffset, dataOut);
     }
     else if (bufferVersion == 2)
@@ -444,7 +479,6 @@ size_t CompressMGARDMeshToGridOperator::InverseOperate(const char *bufferIn, con
         helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator", "InverseOperate",
                                           "invalid mgard buffer version");
     }
-    blockId ++;
     return 0;
 }
 
