@@ -1,4 +1,4 @@
-MGARDPlug operator developed to compress and decompress arbitrary unstructured meshed data. This operator is part of ADIOS's plug library, which will perform compression/decompression inside ADIOS's PUT and GET operation. 
+MGARDPlug operator has been developed to compress and decompress arbitrary unstructured meshed data. This operator is part of ADIOS's plug library, which will perform compression/decompression inside ADIOS's PUT and GET operation. 
 
 Once installed, this operator can be used through "var.AddOperation("plugin", params);".
 
