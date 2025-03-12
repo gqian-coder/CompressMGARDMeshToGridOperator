@@ -420,13 +420,13 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
             void *GridPointVal = NULL; 
             mgard_x::decompress(bufferIn + bufferInOffset, compressedSize_resi, dataOutVoid, true);
             mgard_x::decompress(bufferIn + bufferInOffset + compressedSize_resi, sizeIn - bufferInOffset - compressedSize_resi, GridPointVal, false);
-            std::cout << "nodeMapGrid: " << nodeMapGrid.size() << ", " << nodeMapGrid[blockId].size() << "\n";
+            //std::cout << "nodeMapGrid: " << nodeMapGrid.size() << ", " << nodeMapGrid[blockId].size() << "\n";
             if (type == helper::GetDataType<float>()) {
                 recompose_remesh<float>(nodeMapGrid[blockId], GridPointVal, dataOutVoid);
             } else if (type == helper::GetDataType<double>()) {
                 recompose_remesh<double>(nodeMapGrid[blockId], GridPointVal, dataOutVoid);
             }
-            std::cout << "finish recompositing\n";
+            //std::cout << "finish recompositing\n";
         }
         catch (...)
         {
