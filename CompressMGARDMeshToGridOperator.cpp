@@ -68,10 +68,10 @@ size_t ReadMapping(std::string mappingfile, size_t blockID)
     }
 
     size_t offsetGrid = 0, offsetNode = 0;
-    var_map = io_map.InquireVariable<size_t>("MeshGridMap");
-    var_cluster = io_map.InquireVariable<size_t>("MeshGridCluster");
-    var_gridDim = io_map.InquireVariable<size_t>("GridDim");
-    var_sparse = io_map.InquireVariable<char>("GridSparsity");
+    var_map = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/MeshGridMap");
+    var_cluster = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/MeshGridCluster");
+    var_gridDim = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/GridDim");
+    var_sparse = io_map.InquireVariable<char>("__mesh_grid_mapping__/GridSparsity");
     auto info = reader_map.BlocksInfo(var_map, 0);
     if (debugging)
         std::cout << "  number of blocks in total: " << info.size() << "\n";
