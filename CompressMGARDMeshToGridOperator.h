@@ -11,6 +11,7 @@
 #ifndef COMPRESSMGARDMESHTOGRIDOPERATOR_H_
 #define COMPRESSMGARDMESHTOGRIDOPERATOR_H_
 
+#include "adios2.h"
 #include "adios2/common/ADIOSTypes.h"
 #include "adios2/operator/plugin/PluginOperatorInterface.h"
 
@@ -25,7 +26,9 @@ class CompressMGARDMeshToGridOperator : public PluginOperatorInterface
 public:
     CompressMGARDMeshToGridOperator(const Params &parameters);
 
-    ~CompressMGARDMeshToGridOperator() = default;
+    ~CompressMGARDMeshToGridOperator();
+
+    void AddExtraParameters(const Params &params) override;
 
     /**
      * @param dataIn
@@ -35,8 +38,8 @@ public:
      * @param bufferOut
      * @return size of compressed buffer
      */
-    size_t Operate(const char *dataIn, const Dims &blockStart, const Dims &blockCount, const DataType type,
-                   char *bufferOut) override;
+    size_t Operate(const char *dataIn, const Dims &blockStart, const Dims &blockCount,
+                   const DataType type, char *bufferOut) override;
 
     /**
      * @param bufferIn
@@ -64,6 +67,16 @@ private:
     size_t DecompressV1(const char *bufferIn, const size_t sizeIn, char *dataOut);
 
     std::string m_VersionInfo;
+
+    std::string m_MappingFile; // parameter meshfile
+
+    // the block id used for the associated metadata stored in mesh vectors
+    size_t m_BlockId;
+    size_t m_MapId; // index in mapping vector variables (blockid -> index)
+
+    // extra parameters passed to Operate/InverseOperate
+    std::string m_EngineName;
+    std::string m_VariableName;
 };
 
 } // end namespace plugin
