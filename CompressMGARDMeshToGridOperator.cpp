@@ -55,7 +55,7 @@ size_t ReadMapping(std::string mappingfile, size_t blockID)
     }
 
     adios2::Variable<size_t> var_map, var_cluster, var_gridDim;
-    adios2::Variable<char> var_sparse;
+    adios2::Variable<uint8_t> var_sparse;
 
     if (!io_map)
     {
@@ -71,7 +71,7 @@ size_t ReadMapping(std::string mappingfile, size_t blockID)
     var_map = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/MeshGridMap");
     var_cluster = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/MeshGridCluster");
     var_gridDim = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/GridDim");
-    var_sparse = io_map.InquireVariable<char>("__mesh_grid_mapping__/GridSparsity");
+    var_sparse = io_map.InquireVariable<uint8_t>("__mesh_grid_mapping__/GridSparsity");
     auto info = reader_map.BlocksInfo(var_map, 0);
     if (debugging)
         std::cout << "  number of blocks in total: " << info.size() << "\n";
@@ -81,11 +81,11 @@ size_t ReadMapping(std::string mappingfile, size_t blockID)
     var_gridDim.SetBlockSelection(blockID);
     var_sparse.SetBlockSelection(blockID);
     std::vector<size_t> nodeMapGrid_t, nCluster_t, resampleRate_t;
-    char sparsity_t;
+    uint8_t sparsity_t;
     reader_map.Get<size_t>(var_map, nodeMapGrid_t, adios2::Mode::Sync);
     reader_map.Get<size_t>(var_cluster, nCluster_t, adios2::Mode::Sync);
     reader_map.Get<size_t>(var_gridDim, resampleRate_t, adios2::Mode::Sync);
-    reader_map.Get<char>(var_sparse, &sparsity_t, adios2::Mode::Sync);
+    reader_map.Get<uint8_t>(var_sparse, &sparsity_t, adios2::Mode::Sync);
     reader_map.PerformGets();
     nodeMapGrid.push_back(nodeMapGrid_t);
     nCluster.push_back(nCluster_t);
