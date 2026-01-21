@@ -6,9 +6,13 @@
  *
  *  Created on: Dec 1, 2021
  *      Author: Jason Wang jason.ruonan.wang@gmail.com
+ *  Modified on: Jan 17, 2026
+ *      Added GPU acceleration for mesh-to-grid interpolation and recomposition
+ *      Portable across NVIDIA (CUDA) and AMD (HIP) GPUs
  */
 
 #include "CompressMGARDMeshToGridOperator.h"
+#include "CompressMGARDMeshToGridOperator_GPU.hpp"
 
 #include "adios2/core/Engine.h"
 #include "adios2/helper/adiosFunctions.h"
@@ -19,6 +23,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <chrono>  // For timing
 
 namespace adios2
 {
@@ -32,6 +37,18 @@ std::mutex readMappingMutex;
 std::map<size_t, size_t> blockMeshMap;
 
 const bool debugging = false;
+
+// Flag to enable/disable GPU acceleration
+// Can be disabled at runtime by setting environment variable: MGARD_MESHGRID_USE_CPU=1
+bool useGPU = []() {
+    const char* env = std::getenv("MGARD_MESHGRID_USE_CPU");
+    if (env && (std::string(env) == "1" || std::string(env) == "true" || std::string(env) == "TRUE"))
+        return false;
+    return true;
+}();
+
+// Flag to print GPU status only once
+static bool gpuStatusPrinted = false;
 
 std::vector<std::vector<size_t>> nodeMapGrid;  // stacking multiple blocks of parameters
 std::vector<std::vector<size_t>> nCluster;     // stacking multiple blocks of parameters
@@ -50,7 +67,7 @@ size_t ReadMapping(std::string mappingfile, size_t blockID)
     mappingFileName = mappingfile;
     if (debugging)
     {
-        std::cout << "Reading Mesh File " << mappingfile << "starting from block " << blockID
+        std::cout << "Reading Mesh File " << mappingfile << " starting from block " << blockID
                   << "\n";
     }
 
@@ -68,24 +85,135 @@ size_t ReadMapping(std::string mappingfile, size_t blockID)
     }
 
     size_t offsetGrid = 0, offsetNode = 0;
+    
+    // Variables might be stored as size_t or uint64_t depending on the version
+    // Try with prefix first (newer format), then without prefix (older format)
     var_map = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/MeshGridMap");
+    if (!var_map)
+    {
+        var_map = io_map.InquireVariable<size_t>("MeshGridMap");
+    }
+    // Try uint64_t if size_t didn't work (ADIOS2 type matching is strict)
+    adios2::Variable<uint64_t> var_map_u64;
+    if (!var_map)
+    {
+        var_map_u64 = io_map.InquireVariable<uint64_t>("__mesh_grid_mapping__/MeshGridMap");
+        if (!var_map_u64)
+        {
+            var_map_u64 = io_map.InquireVariable<uint64_t>("MeshGridMap");
+        }
+    }
+    
     var_cluster = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/MeshGridCluster");
+    if (!var_cluster)
+    {
+        var_cluster = io_map.InquireVariable<size_t>("MeshGridCluster");
+    }
+    adios2::Variable<uint64_t> var_cluster_u64;
+    if (!var_cluster)
+    {
+        var_cluster_u64 = io_map.InquireVariable<uint64_t>("__mesh_grid_mapping__/MeshGridCluster");
+        if (!var_cluster_u64)
+        {
+            var_cluster_u64 = io_map.InquireVariable<uint64_t>("MeshGridCluster");
+        }
+    }
+    
     var_gridDim = io_map.InquireVariable<size_t>("__mesh_grid_mapping__/GridDim");
+    if (!var_gridDim)
+    {
+        var_gridDim = io_map.InquireVariable<size_t>("GridDim");
+    }
+    adios2::Variable<uint64_t> var_gridDim_u64;
+    if (!var_gridDim)
+    {
+        var_gridDim_u64 = io_map.InquireVariable<uint64_t>("__mesh_grid_mapping__/GridDim");
+        if (!var_gridDim_u64)
+        {
+            var_gridDim_u64 = io_map.InquireVariable<uint64_t>("GridDim");
+        }
+    }
+    
     var_sparse = io_map.InquireVariable<uint8_t>("__mesh_grid_mapping__/GridSparsity");
-    auto info = reader_map.BlocksInfo(var_map, 0);
+    if (!var_sparse)
+    {
+        var_sparse = io_map.InquireVariable<uint8_t>("GridSparsity");
+    }
+    
+    // Determine which type was found
+    bool use_uint64 = !var_map && var_map_u64;
+    
+    // Check if all required variables were found
+    if ((!var_map && !var_map_u64) || (!var_cluster && !var_cluster_u64) || (!var_gridDim && !var_gridDim_u64))
+    {
+        std::cerr << "Error: Could not find required mapping variables in " << mappingfile << std::endl;
+        std::cerr << "  MeshGridMap: " << ((var_map || var_map_u64) ? "found" : "NOT FOUND") << std::endl;
+        std::cerr << "  MeshGridCluster: " << ((var_cluster || var_cluster_u64) ? "found" : "NOT FOUND") << std::endl;
+        std::cerr << "  GridDim: " << ((var_gridDim || var_gridDim_u64) ? "found" : "NOT FOUND") << std::endl;
+        std::cerr << "  GridSparsity: " << (var_sparse ? "found" : "NOT FOUND (optional)") << std::endl;
+        throw std::runtime_error("Missing required mapping variables");
+    }
+    
+    auto info = use_uint64 ? reader_map.BlocksInfo(var_map_u64, 0) : reader_map.BlocksInfo(var_map, 0);
     if (debugging)
-        std::cout << "  number of blocks in total: " << info.size() << "\n";
+        std::cout << "  number of blocks in total: " << info.size() << std::endl;
 
-    var_map.SetBlockSelection(blockID);
-    var_cluster.SetBlockSelection(blockID);
-    var_gridDim.SetBlockSelection(blockID);
-    var_sparse.SetBlockSelection(blockID);
     std::vector<size_t> nodeMapGrid_t, nCluster_t, resampleRate_t;
-    uint8_t sparsity_t;
-    reader_map.Get<size_t>(var_map, nodeMapGrid_t, adios2::Mode::Sync);
-    reader_map.Get<size_t>(var_cluster, nCluster_t, adios2::Mode::Sync);
-    reader_map.Get<size_t>(var_gridDim, resampleRate_t, adios2::Mode::Sync);
-    reader_map.Get<uint8_t>(var_sparse, &sparsity_t, adios2::Mode::Sync);
+    uint8_t sparsity_t = 0;  // Default to non-sparse
+    
+    if (use_uint64)
+    {
+        // Use uint64_t versions
+        var_map_u64.SetBlockSelection(blockID);
+        var_cluster_u64.SetBlockSelection(blockID);
+        var_gridDim_u64.SetBlockSelection(blockID);
+        
+        std::vector<uint64_t> nodeMapGrid_u64, nCluster_u64, resampleRate_u64;
+        reader_map.Get<uint64_t>(var_map_u64, nodeMapGrid_u64, adios2::Mode::Sync);
+        reader_map.Get<uint64_t>(var_cluster_u64, nCluster_u64, adios2::Mode::Sync);
+        reader_map.Get<uint64_t>(var_gridDim_u64, resampleRate_u64, adios2::Mode::Sync);
+        
+        // Convert to size_t
+        nodeMapGrid_t.assign(nodeMapGrid_u64.begin(), nodeMapGrid_u64.end());
+        nCluster_t.assign(nCluster_u64.begin(), nCluster_u64.end());
+        resampleRate_t.assign(resampleRate_u64.begin(), resampleRate_u64.end());
+    }
+    else
+    {
+        // Use size_t versions
+        var_map.SetBlockSelection(blockID);
+        var_cluster.SetBlockSelection(blockID);
+        var_gridDim.SetBlockSelection(blockID);
+        
+        reader_map.Get<size_t>(var_map, nodeMapGrid_t, adios2::Mode::Sync);
+        reader_map.Get<size_t>(var_cluster, nCluster_t, adios2::Mode::Sync);
+        reader_map.Get<size_t>(var_gridDim, resampleRate_t, adios2::Mode::Sync);
+    }
+    
+    // Handle GridSparsity which might be uint8_t or char type, or might not exist
+    if (var_sparse)
+    {
+        var_sparse.SetBlockSelection(blockID);
+        reader_map.Get<uint8_t>(var_sparse, &sparsity_t, adios2::Mode::Sync);
+    }
+    else
+    {
+        // Try char type (older format)
+        auto var_sparse_char = io_map.InquireVariable<char>("__mesh_grid_mapping__/GridSparsity");
+        if (!var_sparse_char)
+        {
+            var_sparse_char = io_map.InquireVariable<char>("GridSparsity");
+        }
+        if (var_sparse_char)
+        {
+            var_sparse_char.SetBlockSelection(blockID);
+            char sparsity_char;
+            reader_map.Get<char>(var_sparse_char, &sparsity_char, adios2::Mode::Sync);
+            sparsity_t = static_cast<uint8_t>(sparsity_char);
+        }
+        // If still not found, use default (non-sparse)
+    }
+    
     reader_map.PerformGets();
     nodeMapGrid.push_back(nodeMapGrid_t);
     nCluster.push_back(nCluster_t);
@@ -179,6 +307,30 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
                                                 const Dims &blockCount, const DataType type,
                                                 char *bufferOut)
 {
+    // Print GPU status once at first use
+    if (!gpuStatusPrinted)
+    {
+        gpuStatusPrinted = true;
+        std::cout << "[CompressMGARDMeshToGridOperator] GPU Support: ";
+#if defined(ENABLE_HIP)
+        if (!useGPU)
+            std::cout << "HIP/ROCm - DISABLED via MGARD_MESHGRID_USE_CPU=1\n";
+        else if (gpu::isGPUAvailable())
+            std::cout << "HIP/ROCm (AMD GPU) - ENABLED and AVAILABLE\n";
+        else
+            std::cout << "HIP/ROCm (AMD GPU) - compiled but NO GPU AVAILABLE\n";
+#elif defined(ENABLE_CUDA)
+        if (!useGPU)
+            std::cout << "CUDA - DISABLED via MGARD_MESHGRID_USE_CPU=1\n";
+        else if (gpu::isGPUAvailable())
+            std::cout << "CUDA (NVIDIA GPU) - ENABLED and AVAILABLE\n";
+        else
+            std::cout << "CUDA (NVIDIA GPU) - compiled but NO GPU AVAILABLE\n";
+#else
+        std::cout << "DISABLED (CPU-only build)\n";
+#endif
+    }
+
     if (debugging)
         std::cout << "=== CompressMGARDMeshToGridOperator::Operate() ===" << std::endl;
 
@@ -369,6 +521,23 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     }
     mgard_x::Config config;
     config.lossless = mgard_x::lossless_type::Huffman_Zstd;
+    
+    // Set device type for MGARD GPU acceleration
+#if defined(ENABLE_HIP)
+    if (useGPU && gpu::isGPUAvailable())
+    {
+        config.dev_type = mgard_x::device_type::HIP;
+        if (debugging)
+            std::cout << "MGARD config: using HIP device\n";
+    }
+#elif defined(ENABLE_CUDA)
+    if (useGPU && gpu::isGPUAvailable())
+    {
+        config.dev_type = mgard_x::device_type::CUDA;
+        if (debugging)
+            std::cout << "MGARD config: using CUDA device\n";
+    }
+#endif
 
     PutParameter(bufferOut, bufferOutOffset, true);
 
@@ -387,27 +556,115 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     {
         nbytes = sizeof(double);
     }
-    char *MeshResidVal = (char *)malloc(nbytes * nNodePt);
-    memcpy(MeshResidVal, dataIn, nbytes * nNodePt);
-    char *GridPointVal = (char *)malloc(nGridPt * nbytes);
-    ;
-    memset(GridPointVal, 0, nbytes * nGridPt);
-    if (type == helper::GetDataType<float>())
+    
+    // Pointers for mesh residual and grid values
+    // These can be either host or device pointers depending on GPU availability
+    void *MeshResidVal = nullptr;
+    void *GridPointVal = nullptr;
+    void *d_MeshResidVal = nullptr;  // Device pointer (if GPU used)
+    void *d_GridPointVal = nullptr;  // Device pointer (if GPU used)
+    bool gpuUsed = false;
+    
+    // Timing for performance analysis
+    static double total_meshgrid_time = 0.0;
+    static double total_mgard_resi_time = 0.0;
+    static double total_mgard_grid_time = 0.0;
+    static int block_count = 0;
+    auto t_start = std::chrono::steady_clock::now();
+    
+    // Try GPU acceleration for mesh-to-grid interpolation and residual calculation
+    // This keeps data on GPU to avoid redundant CPU<->GPU transfers with MGARD
+    if (useGPU && gpu::isGPUAvailable())
     {
-        calc_GridValResi<float>(nodeMapGrid[m_MapId], nCluster[m_MapId], MeshResidVal, GridPointVal,
-                                nNodePt, nGridPt);
+        if (debugging)
+        {
+#if defined(ENABLE_HIP)
+            std::cout << "Block " << m_BlockId << ": Attempting GPU acceleration (HIP/ROCm backend)\n";
+#elif defined(ENABLE_CUDA)
+            std::cout << "Block " << m_BlockId << ": Attempting GPU acceleration (CUDA backend)\n";
+#else
+            std::cout << "Block " << m_BlockId << ": Attempting GPU acceleration (unknown backend)\n";
+#endif
+        }
+        
+        if (type == helper::GetDataType<float>())
+        {
+            gpuUsed = gpu::calc_GridValResi_GPU<float>(
+                nodeMapGrid[m_MapId], nCluster[m_MapId], 
+                dataIn, nNodePt, nGridPt,
+                &d_MeshResidVal, &d_GridPointVal);
+        }
+        else if (type == helper::GetDataType<double>())
+        {
+            gpuUsed = gpu::calc_GridValResi_GPU<double>(
+                nodeMapGrid[m_MapId], nCluster[m_MapId], 
+                dataIn, nNodePt, nGridPt,
+                &d_MeshResidVal, &d_GridPointVal);
+        }
+        if (gpuUsed)
+        {
+            // Use device pointers - MGARD will detect and use them directly
+            MeshResidVal = d_MeshResidVal;
+            GridPointVal = d_GridPointVal;
+            if (debugging)
+            {
+#if defined(ENABLE_HIP)
+                std::cout << "Block " << m_BlockId << ": GPU acceleration active (HIP/ROCm), data stays on GPU\n";
+#elif defined(ENABLE_CUDA)
+                std::cout << "Block " << m_BlockId << ": GPU acceleration active (CUDA), data stays on GPU\n";
+#endif
+            }
+        }
     }
-    else if (type == helper::GetDataType<double>())
+    
+    // Fall back to CPU if GPU is not available or failed
+    if (!gpuUsed)
     {
-        calc_GridValResi<double>(nodeMapGrid[m_MapId], nCluster[m_MapId], MeshResidVal,
-                                 GridPointVal, nNodePt, nGridPt);
+        if (debugging)
+        {
+            if (useGPU)
+                std::cout << "Block " << m_BlockId << ": GPU not available or failed, using CPU fallback\n";
+            else
+                std::cout << "Block " << m_BlockId << ": Using CPU (GPU disabled)\n";
+        }
+        
+        // Allocate host memory
+        MeshResidVal = malloc(nbytes * nNodePt);
+        memcpy(MeshResidVal, dataIn, nbytes * nNodePt);
+        GridPointVal = malloc(nGridPt * nbytes);
+        memset(GridPointVal, 0, nbytes * nGridPt);
+        
+        if (type == helper::GetDataType<float>())
+        {
+            calc_GridValResi<float>(nodeMapGrid[m_MapId], nCluster[m_MapId], 
+                                    (char*)MeshResidVal, (char*)GridPointVal,
+                                    nNodePt, nGridPt);
+        }
+        else if (type == helper::GetDataType<double>())
+        {
+            calc_GridValResi<double>(nodeMapGrid[m_MapId], nCluster[m_MapId], 
+                                     (char*)MeshResidVal, (char*)GridPointVal,
+                                     nNodePt, nGridPt);
+        }
+        if (debugging)
+            std::cout << "Block " << m_BlockId << ": CPU used for calc_GridValResi\n";
     }
+    
+    auto t_meshgrid_done = std::chrono::steady_clock::now();
+    double meshgrid_time = std::chrono::duration<double>(t_meshgrid_done - t_start).count();
+    total_meshgrid_time += meshgrid_time;
+    
     // compress mesh residuals...saving 8 bytes for storing the compressed
     // meshResi size
+    // Note: MGARD will detect if MeshResidVal is a device pointer and use it directly
     void *compressedData = bufferOut + bufferOutOffset + sizeof(size_t);
+    
+    auto t_resi_start = std::chrono::steady_clock::now();
     mgard_x::compress(mgardDim, mgardType, mgardCount, tol_data, s, errorBoundType, MeshResidVal,
                       compressedData, sizeOut, config, true);
-    free(MeshResidVal);
+    auto t_resi_done = std::chrono::steady_clock::now();
+    double resi_compress_time = std::chrono::duration<double>(t_resi_done - t_resi_start).count();
+    total_mgard_resi_time += resi_compress_time;
 
     if (debugging)
         std::cout << "Block " << m_BlockId << ": bufferOutOffset before = " << bufferOutOffset;
@@ -437,16 +694,52 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
         mgardDim_gd = 1;
         mgardCount_gd.push_back(nGridPt);
     }
+    // Note: MGARD will detect if GridPointVal is a device pointer and use it directly
+    auto t_grid_start = std::chrono::steady_clock::now();
     mgard_x::compress(mgardDim_gd, mgardType, mgardCount_gd, tol_resi, s, errorBoundType,
                       GridPointVal, compressedData, sizeOut, config, true);
+    auto t_grid_done = std::chrono::steady_clock::now();
+    double grid_compress_time = std::chrono::duration<double>(t_grid_done - t_grid_start).count();
+    total_mgard_grid_time += grid_compress_time;
+    
     bufferOutOffset += sizeOut;
+    
+    block_count++;
+    
+    // Print timing summary periodically (every 10 blocks or at specific blocks)
+    // Disabled for now - uncomment to enable timing output
+    // if (m_BlockId == 0 || (block_count % 10 == 0))
+    // {
+    //     std::cout << "[TIMING] Block " << m_BlockId << ": mesh-to-grid=" << meshgrid_time*1000 << "ms, "
+    //               << "MGARD MeshResid=" << resi_compress_time*1000 << "ms, "
+    //               << "MGARD GridPt=" << grid_compress_time*1000 << "ms, "
+    //               << "GPU=" << (gpuUsed ? "YES" : "NO") << "\n";
+    // }
+    // // Print cumulative at end (block 95 for 96 blocks)
+    // if (m_BlockId == 95)
+    // {
+    //     std::cout << "[TIMING SUMMARY] Total mesh-to-grid: " << total_meshgrid_time << "s, "
+    //               << "Total MGARD MeshResid: " << total_mgard_resi_time << "s, "
+    //               << "Total MGARD GridPt: " << total_mgard_grid_time << "s, "
+    //               << "Blocks: " << block_count << "\n";
+    // }
+    
     if (debugging)
         std::cout << "final bufferOutOffset = " << bufferOutOffset
                   << " (compressed GridPt size = " << sizeOut << ")\n";
-    // compressedDataSize += sizeOut;
-    // std::cout << "Block " << blockId << " total compressed bytes=" <<
-    // compressedDataSize << "\n";
-    free(GridPointVal);
+    
+    // Cleanup: free memory (GPU or CPU depending on what was used)
+    if (gpuUsed)
+    {
+        gpu::GPUMemoryManager::freeDevice(d_MeshResidVal);
+        gpu::GPUMemoryManager::freeDevice(d_GridPointVal);
+    }
+    else
+    {
+        free(MeshResidVal);
+        free(GridPointVal);
+    }
+    
     return bufferOutOffset;
 }
 
@@ -513,13 +806,63 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
                                 sizeIn - bufferInOffset - compressedSize_resi, GridPointVal, false);
             // std::cout << "nodeMapGrid: " << nodeMapGrid.size() << ", " <<
             // nodeMapGrid[mapID].size() << "\n";
-            if (type == helper::GetDataType<float>())
+            
+            size_t nNodePt = nodeMapGrid[mapID].size();
+            size_t nGridPt = nCluster[mapID].size();
+            
+            // Try GPU acceleration for recomposition
+            bool gpuUsed = false;
+            if (useGPU && gpu::isGPUAvailable())
             {
-                recompose_remesh<float>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
+                if (debugging)
+                {
+#if defined(ENABLE_HIP)
+                    std::cout << "Block " << blockID << ": Attempting GPU recomposition (HIP/ROCm backend)\n";
+#elif defined(ENABLE_CUDA)
+                    std::cout << "Block " << blockID << ": Attempting GPU recomposition (CUDA backend)\n";
+#else
+                    std::cout << "Block " << blockID << ": Attempting GPU recomposition (unknown backend)\n";
+#endif
+                }
+                
+                if (type == helper::GetDataType<float>())
+                {
+                    gpuUsed = gpu::recompose_remesh_GPU<float>(
+                        nodeMapGrid[mapID], GridPointVal, dataOutVoid, nNodePt, nGridPt);
+                }
+                else if (type == helper::GetDataType<double>())
+                {
+                    gpuUsed = gpu::recompose_remesh_GPU<double>(
+                        nodeMapGrid[mapID], GridPointVal, dataOutVoid, nNodePt, nGridPt);
+                }
+                if (debugging && gpuUsed)
+                {
+#if defined(ENABLE_HIP)
+                    std::cout << "Block " << blockID << ": GPU recomposition complete (HIP/ROCm)\n";
+#elif defined(ENABLE_CUDA)
+                    std::cout << "Block " << blockID << ": GPU recomposition complete (CUDA)\n";
+#endif
+                }
             }
-            else if (type == helper::GetDataType<double>())
+            
+            // Fall back to CPU if GPU is not available or failed
+            if (!gpuUsed)
             {
-                recompose_remesh<double>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
+                if (debugging)
+                {
+                    if (useGPU)
+                        std::cout << "Block " << blockID << ": GPU not available or failed for recomposition, using CPU\n";
+                    else
+                        std::cout << "Block " << blockID << ": Using CPU for recomposition (GPU disabled)\n";
+                }
+                if (type == helper::GetDataType<float>())
+                {
+                    recompose_remesh<float>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
+                }
+                else if (type == helper::GetDataType<double>())
+                {
+                    recompose_remesh<double>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
+                }
             }
             // std::cout << "finish recompositing\n";
         }
