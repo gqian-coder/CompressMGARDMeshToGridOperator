@@ -1,11 +1,18 @@
 /**
  * @file LosslessCompression.hpp
- * @brief Lossless compression for residual data using Quantization + Huffman + ZSTD.
+ * @brief Error-bounded compression for residual data using Quantization + Huffman + ZSTD.
  * 
  * This module provides an alternative to MGARD for residual data compression.
- * For residuals without clear spatial correlations, using direct lossless 
+ * For residuals without clear spatial correlations, using direct quantized 
  * compression (quantization + Huffman + ZSTD) can be more efficient than
  * MGARD's wavelet-like decomposition.
+ * 
+ * NOTE: Despite the file name, this is NOT purely lossless compression.
+ * The pipeline is:
+ *   1. Quantization (lossy, error-bounded by tolerance)
+ *   2. Huffman encoding (lossless)
+ *   3. ZSTD compression (lossless)
+ * The overall method is error-bounded lossy compression.
  * 
  * Created: February 4, 2026
  * Based on: /ccs/proj/cfd164/gongq/refactorMesh/p_multilevel/src/lossless_compression.cpp

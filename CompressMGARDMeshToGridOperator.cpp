@@ -516,9 +516,9 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
         
         if (!success)
         {
-            // Fall back to MGARD if lossless compression fails
+            // Fall back to MGARD if Huffman_ZSTD compression fails
             if (debugging)
-                std::cout << "Block " << m_BlockId << ": Lossless compression failed, falling back to MGARD\n";
+                std::cout << "Block " << m_BlockId << ": Huffman_ZSTD compression failed, falling back to MGARD\n";
             methodMarker = 0;
             // Rewrite marker
             bufferOutOffset -= 1;
@@ -528,7 +528,7 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
         }
         else if (debugging)
         {
-            std::cout << "Block " << m_BlockId << ": Lossless compression successful, size = " << sizeOut << "\n";
+            std::cout << "Block " << m_BlockId << ": Quantization + Huffman + ZSTD compression successful, size = " << sizeOut << "\n";
         }
     }
     else
@@ -700,6 +700,20 @@ size_t CompressMGARDMeshToGridOperator::DecompressV2(const char *bufferIn, const
     // V2: Read residual compression method marker (1 byte)
     uint8_t residualMethodMarker = GetParameter<uint8_t>(bufferIn, bufferInOffset);
     
+    if (debugging)
+    {
+        const char* methodName = "Unknown";
+        switch (residualMethodMarker)
+        {
+            case 0: methodName = "MGARD"; break;
+            case 1: methodName = "Huffman_ZSTD"; break;
+            case 2: methodName = "ZSTD_Only"; break;
+            case 3: methodName = "Auto"; break;
+        }
+        std::cout << "Block " << blockID << ": Residual method marker = " 
+                  << (int)residualMethodMarker << " (" << methodName << ")\n";
+    }
+    
     size_t compressedSize_resi = GetParameter<size_t>(bufferIn, bufferInOffset);
 
     size_t sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
@@ -722,7 +736,7 @@ size_t CompressMGARDMeshToGridOperator::DecompressV2(const char *bufferIn, const
             
             if (residualMethod == ResidualMethod::Huffman_ZSTD || residualMethod == ResidualMethod::ZSTD_Only)
             {
-                // Use lossless decompression
+                // Use Quantization + Huffman + ZSTD decompression (dequantize after decoding)
                 if (type == helper::GetDataType<float>())
                 {
                     bool success = lossless::DecompressHuffmanZstd<float>(
@@ -731,7 +745,7 @@ size_t CompressMGARDMeshToGridOperator::DecompressV2(const char *bufferIn, const
                     if (!success)
                     {
                         helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator",
-                                                          "DecompressV2", "Lossless decompression failed");
+                                                          "DecompressV2", "Huffman_ZSTD decompression failed");
                     }
                 }
                 else if (type == helper::GetDataType<double>())
@@ -742,11 +756,11 @@ size_t CompressMGARDMeshToGridOperator::DecompressV2(const char *bufferIn, const
                     if (!success)
                     {
                         helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator",
-                                                          "DecompressV2", "Lossless decompression failed");
+                                                          "DecompressV2", "Huffman_ZSTD decompression failed");
                     }
                 }
                 if (debugging)
-                    std::cout << "Block " << blockID << ": Decompressed using lossless method\n";
+                    std::cout << "Block " << blockID << ": Decompressed using Quantization + Huffman + ZSTD\n";
             }
             else
             {
