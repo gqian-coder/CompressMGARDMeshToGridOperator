@@ -1,0 +1,25 @@
+#!/bin/bash
+# Build configuration for CUDA (NVIDIA GPU) version
+# Usage: source this file from the build directory
+
+# Set installation paths (adjust as needed for your system)
+ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios
+MGARD_DIR=/path/to/mgard/install-cuda  # Update this for CUDA installation
+
+# Load necessary modules (if on a cluster)
+# module load cuda
+# module load cmake
+
+# Configure with CUDA support
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_DIR}" \
+  -DENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="70;80"  # Adjust for your GPU (V100=70, A100=80)
+
+echo ""
+echo "Configuration complete. Run 'make' to build."
+echo "The library will be: libCompressMGARDMeshToGridOperator.so"
+echo ""
+echo "To use the plugin:"
+echo "  export ADIOS2_PLUGIN_PATH=\$(pwd)"

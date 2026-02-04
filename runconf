@@ -1,4 +1,4 @@
-ADIOS2_DIR=/home/qian/Software/ADIOS2/install-adios
-MGARD_DIR=/home/qian/Software/MGARD/install-cuda-turing
+ADIOS2_DIR=/lustre/orion/proj-shared/cfd164/gongq/Software/ADIOS2/install-adios/
+MGARD_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD/install-hip-frontier/
 
 cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_DIR}"

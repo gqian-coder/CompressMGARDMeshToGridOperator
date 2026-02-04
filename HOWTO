@@ -39,7 +39,7 @@ accuracy and other parameters are the MGARD operator arguments
 
 Runtime example for gray-scott at /home/qian/Software/ADIOS2/examples/simulations/gray-scott/:
 
-$ export ADIOS2_PLUGIN_PATH=/home/qian/Software/CompressMGARDMeshToGridOperator/build
+$ export ADIOS2_PLUGIN_PATH=/lustre/orion/cfd164/proj-shared/gongq/CompressMGARDMeshToGridOperator/build
 $ mpirun -n 1 ../bin/adios2_simulations_gray-scott simulation/settings-files.json
 
 

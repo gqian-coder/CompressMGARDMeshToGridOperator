@@ -737,19 +737,44 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     if (actualMethod == ResidualMethod::Huffman_ZSTD || actualMethod == ResidualMethod::ZSTD_Only)
     {
         // Use Quantization + Huffman + ZSTD (or just ZSTD)
+        // NOTE: Huffman+ZSTD is CPU-only, so we need to copy GPU data to host first
+        void* hostMeshResidVal = MeshResidVal;
+        bool needsFree = false;
+        
+        if (gpuUsed)
+        {
+            // Allocate host buffer and copy from GPU
+            hostMeshResidVal = malloc(nbytes * nNodePt);
+            if (type == helper::GetDataType<float>())
+            {
+                gpu::GPUMemoryManager::copyDeviceToHost<float>(
+                    reinterpret_cast<float*>(hostMeshResidVal),
+                    reinterpret_cast<float*>(MeshResidVal), nNodePt);
+            }
+            else if (type == helper::GetDataType<double>())
+            {
+                gpu::GPUMemoryManager::copyDeviceToHost<double>(
+                    reinterpret_cast<double*>(hostMeshResidVal),
+                    reinterpret_cast<double*>(MeshResidVal), nNodePt);
+            }
+            needsFree = true;
+            if (debugging)
+                std::cout << "Block " << m_BlockId << ": Copied GPU residuals to host for Huffman compression\n";
+        }
+        
         bool success = false;
         if (type == helper::GetDataType<float>())
         {
             if (actualMethod == ResidualMethod::Huffman_ZSTD)
             {
                 success = lossless::CompressHuffmanZstd<float>(
-                    reinterpret_cast<float*>(MeshResidVal), nNodePt, tol_data,
+                    reinterpret_cast<float*>(hostMeshResidVal), nNodePt, tol_data,
                     compressedData, sizeOut);
             }
             else
             {
                 success = lossless::CompressZstdOnly<float>(
-                    reinterpret_cast<float*>(MeshResidVal), nNodePt, tol_data,
+                    reinterpret_cast<float*>(hostMeshResidVal), nNodePt, tol_data,
                     compressedData, sizeOut);
             }
         }
@@ -758,15 +783,21 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
             if (actualMethod == ResidualMethod::Huffman_ZSTD)
             {
                 success = lossless::CompressHuffmanZstd<double>(
-                    reinterpret_cast<double*>(MeshResidVal), nNodePt, tol_data,
+                    reinterpret_cast<double*>(hostMeshResidVal), nNodePt, tol_data,
                     compressedData, sizeOut);
             }
             else
             {
                 success = lossless::CompressZstdOnly<double>(
-                    reinterpret_cast<double*>(MeshResidVal), nNodePt, tol_data,
+                    reinterpret_cast<double*>(hostMeshResidVal), nNodePt, tol_data,
                     compressedData, sizeOut);
             }
+        }
+        
+        // Free temporary host buffer if we allocated it
+        if (needsFree)
+        {
+            free(hostMeshResidVal);
         }
         
         if (!success)
@@ -796,8 +827,6 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     auto t_resi_done = std::chrono::steady_clock::now();
     double resi_compress_time = std::chrono::duration<double>(t_resi_done - t_resi_start).count();
     total_mgard_resi_time += resi_compress_time;
-    
-    free(MeshResidVal);
 
     if (debugging)
         std::cout << "Block " << m_BlockId << ": bufferOutOffset before = " << bufferOutOffset;

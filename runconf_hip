@@ -1,0 +1,34 @@
+#!/bin/bash
+# Build configuration for HIP (AMD GPU) version on Frontier
+# Usage: source this file from the build directory
+module load rocm/6.3.1
+module load cmake
+
+export CC=amdclang
+export CXX=amdclang++
+
+# Set installation paths
+ADIOS2_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/ADIOS2/install-adios
+MGARD_DIR=/lustre/orion/cfd164/proj-shared/gongq/Software/MGARD/install-hip-frontier
+
+# Load necessary modules on Frontier
+# module load PrgEnv-amd
+# module load rocm
+# module load cmake
+
+# Configure with HIP support for AMD MI250X (gfx90a)
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="${ADIOS2_DIR};${MGARD_DIR}" \
+  -DENABLE_HIP=ON \
+  -DGPU_TARGETS="gfx90a" 
+#  -DROCM_PATH=${ROCM_PATH} \
+#  -DCMAKE_HIP_COMPILER=${ROCM_PATH}/bin/hipcc \
+#  -DCMAKE_CXX_COMPILER=${ROCM_PATH}/bin/hipcc
+
+echo ""
+echo "Configuration complete. Run 'make' to build."
+echo "The library will be: libCompressMGARDMeshToGridOperator.so"
+echo ""
+echo "To use the plugin:"
+echo "  export ADIOS2_PLUGIN_PATH=\$(pwd)"
