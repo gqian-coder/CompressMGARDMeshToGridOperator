@@ -9,11 +9,13 @@
  */
 
 #include "CompressMGARDMeshToGridOperator.h"
+#include "LosslessCompression.hpp"
 
 #include "adios2/core/Engine.h"
 #include "adios2/helper/adiosFunctions.h"
 #include <mgard/MGARDConfig.hpp>
 #include <mgard/compress_x.hpp>
+#include <mgard/compressors.hpp>
 
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +34,29 @@ std::mutex readMappingMutex;
 std::map<size_t, size_t> blockMeshMap;
 
 const bool debugging = false;
+
+// Residual compression method selection
+// Can be set via parameter "residual_method": "mgard" (default), "huffman_zstd", "zstd_only", or "auto"
+enum class ResidualMethod {
+    MGARD,        // Full MGARD compression (default)
+    Huffman_ZSTD, // Quantization + Huffman + ZSTD (better for uncorrelated residuals)
+    ZSTD_Only,    // Quantization + ZSTD only
+    Auto          // Automatically detect based on data characteristics
+};
+
+// Parse residual method from string parameter
+ResidualMethod ParseResidualMethod(const std::string& str) {
+    if (str == "mgard" || str == "MGARD" || str == "Mgard") {
+        return ResidualMethod::MGARD;
+    } else if (str == "huffman_zstd" || str == "Huffman_ZSTD" || str == "huffman") {
+        return ResidualMethod::Huffman_ZSTD;
+    } else if (str == "zstd_only" || str == "ZSTD_Only" || str == "zstd") {
+        return ResidualMethod::ZSTD_Only;
+    } else if (str == "auto" || str == "Auto" || str == "AUTO") {
+        return ResidualMethod::Auto;
+    }
+    return ResidualMethod::Huffman_ZSTD;  // Default
+}
 
 std::vector<std::vector<size_t>> nodeMapGrid;  // stacking multiple blocks of parameters
 std::vector<std::vector<size_t>> nCluster;     // stacking multiple blocks of parameters
@@ -228,7 +253,9 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
         std::cout << "  working with blockId " << m_BlockId << " and mapping id " << m_MapId
                   << std::endl;
 
-    const uint8_t bufferVersion = 1;
+    // Buffer version 2: includes residual compression method marker
+    // Version 1 was MGARD-only, kept for backward compatibility
+    const uint8_t bufferVersion = 2;
     size_t bufferOutOffset = 0;
 
     MakeCommonHeader(bufferOut, bufferOutOffset, bufferVersion);
@@ -357,6 +384,19 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
                                                  "must convert the relative tolerance to abs");
         }
     }
+    
+    // Parse residual compression method
+    // Options: "mgard", "huffman_zstd" (default), "zstd_only", "auto"
+    ResidualMethod residualMethod = ResidualMethod::Huffman_ZSTD;
+    auto itResidualMethod = m_Parameters.find("residual_method");
+    if (itResidualMethod != m_Parameters.end())
+    {
+        residualMethod = ParseResidualMethod(itResidualMethod->second);
+        if (debugging)
+        {
+            std::cout << "Residual compression method: " << itResidualMethod->second << "\n";
+        }
+    }
 
     // let mgard know the output buffer size
     size_t sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
@@ -404,9 +444,99 @@ size_t CompressMGARDMeshToGridOperator::Operate(const char *dataIn, const Dims &
     }
     // compress mesh residuals...saving 8 bytes for storing the compressed
     // meshResi size
-    void *compressedData = bufferOut + bufferOutOffset + sizeof(size_t);
-    mgard_x::compress(mgardDim, mgardType, mgardCount, tol_data, s, errorBoundType, MeshResidVal,
-                      compressedData, sizeOut, config, true);
+    // Also save 1 byte for residual compression method marker
+    void *compressedData = bufferOut + bufferOutOffset + sizeof(size_t) + 1;
+    
+    // Determine actual residual method (handle Auto mode)
+    ResidualMethod actualMethod = residualMethod;
+    if (residualMethod == ResidualMethod::Auto)
+    {
+        // Analyze data characteristics to choose method
+        if (type == helper::GetDataType<float>())
+        {
+            if (lossless::ShouldUseLosslessForResidual(reinterpret_cast<float*>(MeshResidVal), nNodePt, tol_data))
+                actualMethod = ResidualMethod::Huffman_ZSTD;
+            else
+                actualMethod = ResidualMethod::MGARD;
+        }
+        else if (type == helper::GetDataType<double>())
+        {
+            if (lossless::ShouldUseLosslessForResidual(reinterpret_cast<double*>(MeshResidVal), nNodePt, tol_data))
+                actualMethod = ResidualMethod::Huffman_ZSTD;
+            else
+                actualMethod = ResidualMethod::MGARD;
+        }
+        if (debugging)
+        {
+            std::cout << "Block " << m_BlockId << ": Auto-selected residual method = " 
+                      << (actualMethod == ResidualMethod::Huffman_ZSTD ? "Huffman_ZSTD" : "MGARD") << "\n";
+        }
+    }
+    
+    // Store the residual compression method marker (1 byte)
+    // 0 = MGARD, 1 = Huffman_ZSTD, 2 = ZSTD_Only
+    uint8_t methodMarker = static_cast<uint8_t>(actualMethod);
+    PutParameter(bufferOut, bufferOutOffset, methodMarker);
+    
+    // Compress residuals using selected method
+    if (actualMethod == ResidualMethod::Huffman_ZSTD || actualMethod == ResidualMethod::ZSTD_Only)
+    {
+        // Use Quantization + Huffman + ZSTD (or just ZSTD)
+        bool success = false;
+        if (type == helper::GetDataType<float>())
+        {
+            if (actualMethod == ResidualMethod::Huffman_ZSTD)
+            {
+                success = lossless::CompressHuffmanZstd<float>(
+                    reinterpret_cast<float*>(MeshResidVal), nNodePt, tol_data,
+                    compressedData, sizeOut);
+            }
+            else
+            {
+                success = lossless::CompressZstdOnly<float>(
+                    reinterpret_cast<float*>(MeshResidVal), nNodePt, tol_data,
+                    compressedData, sizeOut);
+            }
+        }
+        else if (type == helper::GetDataType<double>())
+        {
+            if (actualMethod == ResidualMethod::Huffman_ZSTD)
+            {
+                success = lossless::CompressHuffmanZstd<double>(
+                    reinterpret_cast<double*>(MeshResidVal), nNodePt, tol_data,
+                    compressedData, sizeOut);
+            }
+            else
+            {
+                success = lossless::CompressZstdOnly<double>(
+                    reinterpret_cast<double*>(MeshResidVal), nNodePt, tol_data,
+                    compressedData, sizeOut);
+            }
+        }
+        
+        if (!success)
+        {
+            // Fall back to MGARD if lossless compression fails
+            if (debugging)
+                std::cout << "Block " << m_BlockId << ": Lossless compression failed, falling back to MGARD\n";
+            methodMarker = 0;
+            // Rewrite marker
+            bufferOutOffset -= 1;
+            PutParameter(bufferOut, bufferOutOffset, methodMarker);
+            mgard_x::compress(mgardDim, mgardType, mgardCount, tol_data, s, errorBoundType, MeshResidVal,
+                              compressedData, sizeOut, config, true);
+        }
+        else if (debugging)
+        {
+            std::cout << "Block " << m_BlockId << ": Lossless compression successful, size = " << sizeOut << "\n";
+        }
+    }
+    else
+    {
+        // Use MGARD compression (default)
+        mgard_x::compress(mgardDim, mgardType, mgardCount, tol_data, s, errorBoundType, MeshResidVal,
+                          compressedData, sizeOut, config, true);
+    }
     free(MeshResidVal);
 
     if (debugging)
@@ -455,16 +585,14 @@ size_t CompressMGARDMeshToGridOperator::GetHeaderSize() const { return headerSiz
 size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const size_t sizeIn,
                                                      char *dataOut)
 {
-    // Do NOT remove even if the buffer version is updated. Data might be still
-    // in lagacy formats. This function must be kept for backward compatibility.
-    // If a newer buffer format is implemented, create another function, e.g.
-    // DecompressV2 and keep this function for decompressing lagacy data.
+    // V1 format: MGARD-only compression, no residual method marker
+    // Kept for backward compatibility with data compressed before lossless support
 
     size_t bufferInOffset = 0;
 
     size_t blockID = GetParameter<size_t>(bufferIn, bufferInOffset);
     if (debugging)
-        std::cout << "Decompressing blockId = " << blockID << "\n";
+        std::cout << "Decompressing blockId = " << blockID << " (V1 format, MGARD-only)\n";
     if (blockMeshMap.find(blockID) == blockMeshMap.end())
     {
         // the requested block has not been loaded
@@ -489,11 +617,9 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
                     ". Please make sure a compatible version is used for decompression.";
 
     const bool isCompressed = GetParameter<bool>(bufferIn, bufferInOffset);
+    
+    // V1 format: no method marker, directly read compressed size
     size_t compressedSize_resi = GetParameter<size_t>(bufferIn, bufferInOffset);
-    // std::cout << "blockId = " << m_BlockId << ", compressed residual data bytes =
-    // " << compressedSize_resi << ", compressed grid data bytes = " << sizeIn -
-    // bufferInOffset - compressedSize_resi << ", sizeIn = " << sizeIn -
-    // bufferInOffset << ", bufferInOffset = " << bufferInOffset << "\n";
 
     size_t sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
 
@@ -508,11 +634,13 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
         {
             void *dataOutVoid = dataOut;
             void *GridPointVal = NULL;
+            
+            // V1: Always use MGARD decompression
             mgard_x::decompress(bufferIn + bufferInOffset, compressedSize_resi, dataOutVoid, true);
+            
             mgard_x::decompress(bufferIn + bufferInOffset + compressedSize_resi,
                                 sizeIn - bufferInOffset - compressedSize_resi, GridPointVal, false);
-            // std::cout << "nodeMapGrid: " << nodeMapGrid.size() << ", " <<
-            // nodeMapGrid[mapID].size() << "\n";
+            
             if (type == helper::GetDataType<float>())
             {
                 recompose_remesh<float>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
@@ -521,12 +649,129 @@ size_t CompressMGARDMeshToGridOperator::DecompressV1(const char *bufferIn, const
             {
                 recompose_remesh<double>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
             }
-            // std::cout << "finish recompositing\n";
         }
         catch (...)
         {
             helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator",
                                               "DecompressV1", m_VersionInfo);
+        }
+        return sizeOut;
+    }
+
+    headerSize += bufferInOffset;
+    return 0;
+}
+
+size_t CompressMGARDMeshToGridOperator::DecompressV2(const char *bufferIn, const size_t sizeIn,
+                                                     char *dataOut)
+{
+    // V2 format: includes residual compression method marker (1 byte)
+    // Supports MGARD, Huffman_ZSTD, and ZSTD_Only for residual compression
+
+    size_t bufferInOffset = 0;
+
+    size_t blockID = GetParameter<size_t>(bufferIn, bufferInOffset);
+    if (debugging)
+        std::cout << "Decompressing blockId = " << blockID << " (V2 format)\n";
+    if (blockMeshMap.find(blockID) == blockMeshMap.end())
+    {
+        std::lock_guard<std::mutex> lck(readMappingMutex);
+        blockMeshMap[blockID] = ReadMapping(m_EngineName, blockID);
+    }
+    size_t mapID = blockMeshMap[blockID];
+    if (debugging)
+        std::cout << "Mapping id = " << mapID << "\n";
+
+    const size_t ndims = GetParameter<size_t, size_t>(bufferIn, bufferInOffset);
+    Dims blockCount(ndims);
+    for (size_t i = 0; i < ndims; ++i)
+    {
+        blockCount[i] = GetParameter<size_t, size_t>(bufferIn, bufferInOffset);
+    }
+    const DataType type = GetParameter<DataType>(bufferIn, bufferInOffset);
+    m_VersionInfo = " Data is compressed using MGARD Version " +
+                    std::to_string(GetParameter<uint8_t>(bufferIn, bufferInOffset)) + "." +
+                    std::to_string(GetParameter<uint8_t>(bufferIn, bufferInOffset)) + "." +
+                    std::to_string(GetParameter<uint8_t>(bufferIn, bufferInOffset)) +
+                    ". Please make sure a compatible version is used for decompression.";
+
+    const bool isCompressed = GetParameter<bool>(bufferIn, bufferInOffset);
+    
+    // V2: Read residual compression method marker (1 byte)
+    uint8_t residualMethodMarker = GetParameter<uint8_t>(bufferIn, bufferInOffset);
+    
+    size_t compressedSize_resi = GetParameter<size_t>(bufferIn, bufferInOffset);
+
+    size_t sizeOut = helper::GetTotalSize(blockCount, helper::GetDataTypeSize(type));
+    size_t nNodePt = nodeMapGrid[mapID].size();
+
+    if (type == DataType::FloatComplex || type == DataType::DoubleComplex)
+    {
+        sizeOut /= 2;
+    }
+
+    if (isCompressed)
+    {
+        try
+        {
+            void *dataOutVoid = dataOut;
+            void *GridPointVal = NULL;
+            
+            // Decompress residuals based on method marker
+            ResidualMethod residualMethod = static_cast<ResidualMethod>(residualMethodMarker);
+            
+            if (residualMethod == ResidualMethod::Huffman_ZSTD || residualMethod == ResidualMethod::ZSTD_Only)
+            {
+                // Use lossless decompression
+                if (type == helper::GetDataType<float>())
+                {
+                    bool success = lossless::DecompressHuffmanZstd<float>(
+                        bufferIn + bufferInOffset, compressedSize_resi,
+                        reinterpret_cast<float*>(dataOutVoid), nNodePt);
+                    if (!success)
+                    {
+                        helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator",
+                                                          "DecompressV2", "Lossless decompression failed");
+                    }
+                }
+                else if (type == helper::GetDataType<double>())
+                {
+                    bool success = lossless::DecompressHuffmanZstd<double>(
+                        bufferIn + bufferInOffset, compressedSize_resi,
+                        reinterpret_cast<double*>(dataOutVoid), nNodePt);
+                    if (!success)
+                    {
+                        helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator",
+                                                          "DecompressV2", "Lossless decompression failed");
+                    }
+                }
+                if (debugging)
+                    std::cout << "Block " << blockID << ": Decompressed using lossless method\n";
+            }
+            else
+            {
+                // Use MGARD decompression
+                mgard_x::decompress(bufferIn + bufferInOffset, compressedSize_resi, dataOutVoid, true);
+            }
+            
+            // Decompress grid interpolation (always uses MGARD)
+            mgard_x::decompress(bufferIn + bufferInOffset + compressedSize_resi,
+                                sizeIn - bufferInOffset - compressedSize_resi, GridPointVal, false);
+            
+            // Recompose mesh values
+            if (type == helper::GetDataType<float>())
+            {
+                recompose_remesh<float>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
+            }
+            else if (type == helper::GetDataType<double>())
+            {
+                recompose_remesh<double>(nodeMapGrid[mapID], GridPointVal, dataOutVoid);
+            }
+        }
+        catch (...)
+        {
+            helper::Throw<std::runtime_error>("Operator", "CompressMGARDMeshToGridOperator",
+                                              "DecompressV2", m_VersionInfo);
         }
         return sizeOut;
     }
@@ -549,12 +794,13 @@ size_t CompressMGARDMeshToGridOperator::InverseOperate(const char *bufferIn, con
 
     if (bufferVersion == 1)
     {
+        // V1: MGARD-only format (backward compatibility)
         return DecompressV1(bufferIn + bufferInOffset, sizeIn - bufferInOffset, dataOut);
     }
     else if (bufferVersion == 2)
     {
-        // TODO: if a Version 2 mgard buffer is being implemented, put it here
-        // and keep the DecompressV1 routine for backward compatibility
+        // V2: Supports multiple residual compression methods
+        return DecompressV2(bufferIn + bufferInOffset, sizeIn - bufferInOffset, dataOut);
     }
     else
     {
