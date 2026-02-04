@@ -59,12 +59,22 @@ private:
      * Decompress function for V1 buffer. Do NOT remove even if the buffer
      * version is updated. Data might be still in lagacy formats. This function
      * must be kept for backward compatibility
-     * @param bufferIn : compressed data buffer (V1 only)
+     * @param bufferIn : compressed data buffer (V1 only, MGARD-only format)
      * @param sizeIn : number of bytes in bufferIn
      * @param dataOut : decompressed data buffer
      * @return : number of bytes in dataOut
      */
     size_t DecompressV1(const char *bufferIn, const size_t sizeIn, char *dataOut);
+
+    /**
+     * Decompress function for V2 buffer. Supports multiple residual compression
+     * methods: MGARD, Huffman_ZSTD, ZSTD_Only.
+     * @param bufferIn : compressed data buffer (V2 format with method marker)
+     * @param sizeIn : number of bytes in bufferIn
+     * @param dataOut : decompressed data buffer
+     * @return : number of bytes in dataOut
+     */
+    size_t DecompressV2(const char *bufferIn, const size_t sizeIn, char *dataOut);
 
     std::string m_VersionInfo;
 
